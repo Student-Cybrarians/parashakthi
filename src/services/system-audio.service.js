@@ -1,65 +1,62 @@
 const { EventEmitter } = require('events');
-const { spawn } = require('child_process');
 const os = require('os');
 
 /**
- * System-audio capture boundary.
+ * Browser-backed desktop audio transport.
  *
- * OS support is intentionally adapter-based: Windows can use WASAPI loopback,
- * macOS can use a virtual loopback device, and Linux can use PipeWire/Pulse
- * monitor sources. The service emits PCM chunks and exposes a device contract;
- * it does not attempt to bypass OS security or meeting permissions.
+ * Windows uses Electron's desktop-capture loopback device. macOS/Linux use an
+ * explicit audio input device (for example BlackHole on macOS or a PipeWire /
+ * Pulse monitor source on Linux). In both cases the renderer converts audio
+ * to mono 16 kHz PCM and sends it here over a narrow IPC channel.
  */
 class SystemAudioService extends EventEmitter {
   constructor(options = {}) {
     super();
     this.platform = options.platform || os.platform();
-    this.process = null;
+    this.sampleRate = options.sampleRate || 16000;
+    this.channels = options.channels || 1;
     this.running = false;
+    this.mode = 'desktop';
     this.bytes = 0;
-    this.command = options.command || process.env.SYSTEM_AUDIO_COMMAND || '';
-    this.args = options.args || [];
   }
 
   isConfigured() {
-    return Boolean(this.command);
+    // Desktop loopback is available through Electron on Windows. Other
+    // platforms require the user to select a monitor/virtual input device.
+    return this.platform === 'win32' || Boolean(process.env.SYSTEM_AUDIO_INPUT_DEVICE);
   }
 
-  start() {
+  start({ mode = 'desktop' } = {}) {
     if (this.running) return;
-    if (!this.isConfigured()) {
-      this.emit('status', { state: 'unavailable', platform: this.platform, reason: 'No system-audio adapter configured' });
-      return;
+    this.mode = mode;
+    if (mode === 'desktop' && this.platform !== 'win32') {
+      this.emit('status', {
+        state: 'needs-input-device',
+        platform: this.platform,
+        reason: 'Select a system-audio input device (for example BlackHole or a PipeWire/Pulse monitor).'
+      });
     }
-
-    this.process = spawn(this.command, this.args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true
-    });
     this.running = true;
-    this.process.stdout.on('data', (chunk) => {
-      this.bytes += chunk.length;
-      this.emit('audio', chunk);
+    this.bytes = 0;
+    this.emit('status', {
+      state: 'started',
+      platform: this.platform,
+      mode: this.mode,
+      sampleRate: this.sampleRate
     });
-    this.process.stderr.on('data', (chunk) => {
-      this.emit('log', String(chunk).trim());
-    });
-    this.process.on('error', (error) => {
-      this.running = false;
-      this.emit('error', error);
-    });
-    this.process.on('close', (code) => {
-      this.running = false;
-      this.emit('status', { state: 'stopped', code, bytes: this.bytes });
-    });
-    this.emit('status', { state: 'started', platform: this.platform });
+  }
+
+  pushRendererPcm(chunk) {
+    if (!this.running || !chunk?.length) return;
+    const pcm = Buffer.from(chunk);
+    this.bytes += pcm.length;
+    this.emit('audio', pcm);
   }
 
   stop() {
-    if (!this.process) return;
-    this.process.kill();
-    this.process = null;
+    if (!this.running) return;
     this.running = false;
+    this.emit('status', { state: 'stopped', platform: this.platform, bytes: this.bytes });
   }
 }
 
