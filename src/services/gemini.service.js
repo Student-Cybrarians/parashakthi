@@ -6,28 +6,31 @@ class GeminiService {
     this.client = apiKey ? new GoogleGenAI({ apiKey }) : null;
   }
 
-  isConfigured() {
-    return Boolean(this.client);
-  }
+  isConfigured() { return Boolean(this.client); }
 
-  async *stream(prompt, { screenshotBase64 = null } = {}) {
+  async *stream(prompt, { screenshotBase64 = null, signal = null, onMetric = null } = {}) {
     if (!this.client) throw new Error('GEMINI_API_KEY is not configured');
+    if (signal?.aborted) throw new Error('Generation cancelled');
+    const started = Date.now();
     const parts = [{ text: prompt }];
-    if (screenshotBase64) {
-      parts.push({ inlineData: { mimeType: 'image/jpeg', data: screenshotBase64 } });
-    }
+    if (screenshotBase64) parts.push({ inlineData: { mimeType: 'image/jpeg', data: screenshotBase64 } });
     const response = await this.client.models.generateContentStream({
       model: this.model,
       contents: [{ role: 'user', parts }],
-      config: {
-        temperature: 0.2,
-        maxOutputTokens: 1200
-      }
+      config: { temperature: 0.2, maxOutputTokens: 1200 }
     });
+    let firstToken = true;
     for await (const chunk of response) {
+      if (signal?.aborted) throw new Error('Generation cancelled');
       const text = chunk?.text || '';
-      if (text) yield text;
+      if (!text) continue;
+      if (firstToken) {
+        firstToken = false;
+        onMetric?.({ name: 'gemini_first_token_ms', value: Date.now() - started });
+      }
+      yield text;
     }
+    onMetric?.({ name: 'gemini_total_ms', value: Date.now() - started });
   }
 }
 
