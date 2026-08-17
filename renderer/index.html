@@ -5,12 +5,17 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Parashakthi</title>
   <style>
-    *{box-sizing:border-box} body{margin:0;font-family:Inter,system-ui,sans-serif;background:rgba(15,15,20,.94);color:#f4f4f5;border:1px solid #27272a;border-radius:16px;overflow:hidden} header{display:flex;justify-content:space-between;align-items:center;padding:12px 14px;border-bottom:1px solid #27272a} .title{font-weight:700} .state{font-size:12px;color:#a1a1aa}.actions{display:flex;gap:8px;padding:12px}.actions button{flex:1;padding:9px;border:0;border-radius:10px;background:#27272a;color:#fff;cursor:pointer}.actions button.primary{background:#fafafa;color:#18181b}.section{padding:0 14px 12px}.label{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:#71717a;margin:8px 0}.box{background:#18181b;border:1px solid #27272a;border-radius:10px;padding:10px;min-height:120px;max-height:220px;overflow:auto;white-space:pre-wrap}.answer{min-height:240px} .muted{color:#71717a}
+    *{box-sizing:border-box}body{margin:0;font-family:Inter,system-ui,sans-serif;background:rgba(15,15,20,.96);color:#f4f4f5;border:1px solid #27272a;border-radius:16px;overflow:hidden}header{display:flex;justify-content:space-between;align-items:center;padding:12px 14px;border-bottom:1px solid #27272a}.title{font-weight:700}.state{font-size:12px;color:#a1a1aa}.actions{display:flex;gap:8px;padding:12px}.actions button{flex:1;padding:9px;border:0;border-radius:10px;background:#27272a;color:#fff;cursor:pointer}.actions button.primary{background:#fafafa;color:#18181b}.controls{padding:0 14px 10px}.controls label{font-size:11px;color:#a1a1aa;display:block;margin-bottom:5px}.controls select{width:100%;padding:8px;border-radius:9px;border:1px solid #3f3f46;background:#18181b;color:#fff}.hint{font-size:11px;color:#71717a;margin-top:6px}.section{padding:0 14px 12px}.label{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:#71717a;margin:8px 0}.box{background:#18181b;border:1px solid #27272a;border-radius:10px;padding:10px;min-height:120px;max-height:220px;overflow:auto;white-space:pre-wrap}.answer{min-height:240px}.muted{color:#71717a}
   </style>
 </head>
 <body>
   <header><div class="title">Parashakthi</div><div id="state" class="state">idle</div></header>
   <div class="actions"><button id="start" class="primary">Start capture</button><button id="stop">Stop</button></div>
+  <div class="controls">
+    <label for="device">Audio input (macOS/Linux fallback)</label>
+    <select id="device"><option value="">Default audio input</option></select>
+    <div class="hint">Windows uses Electron desktop loopback. macOS/Linux can use a virtual/monitor device such as BlackHole or PipeWire/Pulse monitor.</div>
+  </div>
   <div class="section"><div class="label">Live transcript</div><div id="transcript" class="box muted">Waiting for interviewer audio…</div></div>
   <div class="section"><div class="label">Assistant</div><div id="answer" class="box answer muted">Answers will stream here.</div></div>
   <script src="renderer.js"></script>
