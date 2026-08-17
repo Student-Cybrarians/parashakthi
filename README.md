@@ -1,8 +1,29 @@
 # Parashakthi
 
-A privacy-conscious desktop meeting assistant with real-time desktop-audio capture, local streaming ASR, conversation context, and Gemini-assisted responses.
+A privacy-conscious desktop meeting assistant with system-audio capture, local ASR, automatic question detection, screen context, conversation memory, and Gemini-assisted responses.
 
-## Current implementation
+## Feature status
+
+- ✅ Windows desktop/system-audio capture path
+- ✅ macOS/Linux selectable audio input path
+- ✅ 16 kHz mono PCM transport
+- ✅ Persistent Whisper / Parakeet TDT v3 worker
+- ✅ Pause/max-duration utterance segmentation
+- ✅ Automatic interviewer-question detection
+- ✅ Rolling conversation memory
+- ✅ Automatic screen snapshots while capture is active
+- ✅ Multimodal Gemini prompts with the latest screen image
+- ✅ Interview / coding / system-design / behavioral modes
+- ✅ Global `Ctrl/Cmd+Shift+Space` capture toggle
+- ✅ Audio-device selector
+- ✅ Cross-platform Electron packaging
+- ✅ Automated unit tests and CI builds
+- ✅ Tag-triggered release workflow
+- 🟡 True token-level/partial ASR depends on the selected ASR runtime
+- 🟡 Hardware-specific audio validation must run on the target OS
+- 🟡 macOS signing/notarization requires developer credentials
+
+## End-to-end flow
 
 ```text
 Google Meet / browser audio
@@ -24,23 +45,32 @@ Google Meet / browser audio
   Utterance / pause boundary
           |
           v
- Conversation context -> Gemini
+ Question detector
           |
-          v
- Streaming answer UI
+          +-------------------+
+          |                   |
+          v                   v
+ Rolling transcript     Latest screen image
+          |                   |
+          +---------+---------+
+                    v
+               Gemini multimodal
+                    |
+                    v
+             Streaming answer UI
 ```
 
-### Desktop audio
+## Desktop audio
 
-- **Windows:** Electron desktop capture uses the system loopback audio path, so audio played by Google Meet or another browser application can enter the transcription pipeline after the user explicitly starts capture.
-- **macOS 14.2+:** Electron 40 includes the current CoreAudio Tap integration. The application declares `NSAudioCaptureUsageDescription`. For configurations where desktop loopback is not exposed, select a virtual audio input such as BlackHole.
-- **Linux:** select a PipeWire/Pulse monitor source as the audio input. Native desktop loopback is intentionally not assumed because Linux audio routing varies by desktop/session.
+- **Windows:** Electron desktop capture requests the system loopback audio path, allowing browser/meeting playback to enter the transcription pipeline after the user explicitly starts capture.
+- **macOS:** use Electron's supported desktop-audio path where available; otherwise select a virtual audio device such as BlackHole. The package declares the required audio/screen usage descriptions.
+- **Linux:** select a PipeWire/Pulse monitor source. Native routing differs between desktop/session configurations, so the application does not assume one universal device.
 
-Capture is explicit and visible; users are responsible for applicable recording and workplace policies.
+Capture is explicit and visible. Users are responsible for applicable recording, interview, workplace, and meeting policies.
 
 ## ASR providers
 
-Set:
+Whisper:
 
 ```env
 ASR_PROVIDER=whisper
@@ -48,7 +78,7 @@ ASR_PYTHON=python
 WHISPER_MODEL=small
 ```
 
-Or use NVIDIA Parakeet TDT v3 locally:
+Parakeet TDT v3:
 
 ```env
 ASR_PROVIDER=parakeet
@@ -56,15 +86,13 @@ ASR_PYTHON=python
 PARAKEET_MODEL=nvidia/parakeet-tdt-0.6b-v3
 ```
 
-Install the Python runtime dependencies:
+Install the runtime dependencies:
 
 ```bash
 python -m pip install -r requirements-asr.txt
 ```
 
-The first Parakeet run downloads a model of roughly 2.5 GB. The model is loaded once into a persistent worker, rather than reloaded for every utterance.
-
-Parakeet TDT v3 is NVIDIA's 600M-parameter multilingual ASR model and is distributed under CC-BY-4.0. Its current model documentation provides a Transformers pipeline example using `nvidia/parakeet-tdt-0.6b-v3`.
+The first Parakeet run downloads the model and loads it into a persistent worker. Subsequent utterances avoid model initialization overhead.
 
 ## Gemini
 
@@ -73,49 +101,58 @@ Create `.env`:
 ```env
 GEMINI_API_KEY=your_key
 ASR_PROVIDER=parakeet
+GEMINI_MODEL=gemini-2.5-flash
 ```
 
-The application will stream generated responses after an utterance is transcribed.
+Only the resulting transcript/context and the latest screen snapshot are sent to Gemini when the feature is configured. Raw audio remains with the local ASR worker.
 
 ## Run
 
 ```bash
 npm install
+python -m pip install -r requirements-asr.txt
 npm start
 ```
 
-For development:
+Development:
 
 ```bash
 npm run dev
 ```
 
-## Build
+Global capture toggle: **Ctrl+Shift+Space** on Windows/Linux or **Cmd+Shift+Space** on macOS.
+
+## Test and build
 
 ```bash
+npm test
 npm run build
 npm run build:win
 npm run build:mac
 npm run build:linux
 ```
 
+Pushing to `master-branch` runs tests and Windows/macOS/Linux builds. Pushing a `v*` tag triggers the release workflow.
+
 ## Architecture
 
 - `src/services/system-audio.service.js` — audio transport and platform policy.
-- `src/services/asr.service.js` — buffering, utterance boundaries, and worker lifecycle.
+- `src/services/asr.service.js` — buffering, segmentation, worker lifecycle, and recovery.
+- `src/services/question.service.js` — question boundary heuristic.
 - `scripts/asr_worker.py` — persistent Whisper/Parakeet process.
-- `src/services/context.service.js` — rolling conversation context.
-- `src/services/gemini.service.js` — Gemini streaming generation.
-- `renderer/renderer.js` — desktop/input capture and PCM resampling.
+- `src/services/context.service.js` — rolling transcript and screen context.
+- `src/services/gemini.service.js` — Gemini multimodal streaming generation.
+- `renderer/renderer.js` — desktop/input capture, PCM conversion, screen snapshots, and UI.
 - `preload.js` — narrow context-isolated IPC bridge.
 
 ## Known limitations
 
-- Windows has the cleanest fully automatic system-audio path.
+- True token-level partial transcription is provider/runtime dependent; the current stable path emits utterances after pause/max-duration segmentation.
 - macOS/Linux may require a virtual/monitor audio input depending on OS version and audio stack.
-- Parakeet's local runtime is ML-heavy; CPU-only systems may have higher latency. NVIDIA's current model documentation lists Linux and supported NVIDIA GPU architectures as the preferred runtime environment.
-- End-to-end audio and installer validation must run on the target operating system; GitHub source edits alone cannot verify a physical audio device.
+- Parakeet is ML-heavy and may have high CPU latency without suitable acceleration.
+- End-to-end audio, permissions, GPU behavior, and installers must still be exercised on real target machines.
+- macOS release signing/notarization requires the repository owner's Apple Developer credentials.
 
 ## Privacy
 
-Audio is streamed into the local ASR worker when using Whisper/Parakeet. Only the resulting transcript/context is sent to Gemini when the Gemini feature is configured. API secrets are loaded from environment/runtime configuration and are not committed.
+Audio is processed by the configured local ASR worker. Only transcript/context and the latest screen image are sent to Gemini when enabled. API secrets are loaded from environment/runtime configuration and are never committed.
