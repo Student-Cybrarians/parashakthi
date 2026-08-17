@@ -16,7 +16,7 @@ function pcm16ToWav(pcm, sampleRate = 16000, channels = 1) {
   return buffer;
 }
 
-/** Persistent ASR coordinator with overlapping partial recognition. */
+/** Persistent ASR coordinator with overlapping low-latency recognition. */
 class ASRService extends EventEmitter {
   constructor({ provider = 'whisper', silenceMs = 800, maxUtteranceMs = 12000, partialIntervalMs = 2200, partialMinMs = 1400 } = {}) {
     super();
@@ -85,13 +85,16 @@ class ASRService extends EventEmitter {
       const text = await this._transcribeFile(wavPath);
       if (text && text !== this.lastPartial) { this.lastPartial = text; this.emit('partial', { text, provider: this.provider }); }
     } catch (error) { this.emit('status', { state: 'partial-error', provider: this.provider, message: error.message }); }
-    finally { this.partialInFlight = false; fs.rmSync(tempDir, { recursive: true, force: true }); }
+    finally {
+      this.partialInFlight = false; fs.rmSync(tempDir, { recursive: true, force: true });
+      if (this.queuedFlush && this.running && !this.flushInFlight) { this.queuedFlush = false; void this.flush('queued-after-partial'); }
+    }
   }
 
   async flush(reason = 'manual') {
     clearTimeout(this.timer); this.timer = null;
     if (!this.buffer.length) return '';
-    if (this.flushInFlight) { this.queuedFlush = true; return ''; }
+    if (this.flushInFlight || this.partialInFlight) { this.queuedFlush = true; return ''; }
     const audio = Buffer.concat(this.buffer); this.buffer = []; this.startedAt = Date.now(); this.lastPartial = '';
     if (audio.length < 3200) return '';
     this.flushInFlight = true;
@@ -105,7 +108,7 @@ class ASRService extends EventEmitter {
     } catch (error) { this.emit('error', error); return ''; }
     finally {
       this.flushInFlight = false; fs.rmSync(tempDir, { recursive: true, force: true }); this.emit('status', { state: 'listening', provider: this.provider });
-      if (this.queuedFlush) { this.queuedFlush = false; void this.flush('queued'); }
+      if (this.queuedFlush && this.running) { this.queuedFlush = false; void this.flush('queued'); }
     }
   }
 
@@ -117,8 +120,11 @@ class ASRService extends EventEmitter {
 
   async stop() {
     if (!this.running) return;
-    clearInterval(this.partialTimer); this.partialTimer = null; await this.flush('stop'); this.running = false; clearTimeout(this.timer); this.timer = null;
-    if (this.worker && !this.worker.killed) this.worker.kill(); this.worker = null; this.emit('status', { state: 'stopped', provider: this.provider });
+    clearInterval(this.partialTimer); this.partialTimer = null; clearTimeout(this.timer); this.timer = null;
+    await this.flush('stop');
+    this.running = false; this.queuedFlush = false;
+    if (this.worker && !this.worker.killed) this.worker.kill(); this.worker = null;
+    this.emit('status', { state: 'stopped', provider: this.provider });
   }
 }
 module.exports = ASRService;
