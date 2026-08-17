@@ -7,6 +7,7 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron . --no-sandbox --disable-gpu",
+    "test": "node --test test/**/*.test.js",
     "build": "electron-builder",
     "build:win": "electron-builder --win",
     "build:mac": "electron-builder --mac",
@@ -33,11 +34,7 @@
         "NSScreenCaptureUsageDescription": "Parashakthi captures the desktop only when you start meeting context capture."
       }
     },
-    "win": {
-      "target": ["nsis", "zip"]
-    },
-    "linux": {
-      "target": ["AppImage", "deb"]
-    }
+    "win": { "target": ["nsis", "zip"] },
+    "linux": { "target": ["AppImage", "deb"] }
   }
 }
