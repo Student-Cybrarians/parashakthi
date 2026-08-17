@@ -1,0 +1,29 @@
+{
+  "name": "parashakthi",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Real-time desktop meeting and interview assistant",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --no-sandbox --disable-gpu",
+    "build": "electron-builder",
+    "build:win": "electron-builder --win",
+    "build:mac": "electron-builder --mac",
+    "build:linux": "electron-builder --linux"
+  },
+  "dependencies": {
+    "@google/genai": "^2.9.0",
+    "dotenv": "^16.4.7"
+  },
+  "devDependencies": {
+    "electron": "^37.0.0",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "dev.studentcybrarians.parashakthi",
+    "productName": "Parashakthi",
+    "directories": { "output": "dist" },
+    "files": ["**/*", "!dist/**/*", "!.git/**/*", "!.env*"]
+  }
+}
