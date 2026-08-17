@@ -6,10 +6,11 @@ const ASRService = require('./src/services/asr.service');
 const ContextService = require('./src/services/context.service');
 const QuestionService = require('./src/services/question.service');
 const GeminiService = require('./src/services/gemini.service');
+const TelemetryService = require('./src/services/telemetry.service');
 
-let mainWindow, audio, asr, context, questionDetector, gemini;
+let mainWindow, audio, asr, context, questionDetector, gemini, telemetry;
 let running = false;
-let answerInFlight = false;
+let generation = null;
 let assistantMode = process.env.ASSISTANT_MODE || 'interview';
 let lastQuestionAt = 0;
 
@@ -30,8 +31,16 @@ async function configureDesktopCapture() {
   });
 }
 
+function cancelGeneration(reason = 'superseded') {
+  if (!generation) return;
+  generation.controller.abort();
+  mainWindow?.webContents.send('answer-cancelled', { reason });
+  generation = null;
+}
+
 function wirePipeline() {
-  context = new ContextService(); questionDetector = new QuestionService(); gemini = new GeminiService();
+  context = new ContextService(); questionDetector = new QuestionService(); gemini = new GeminiService(); telemetry = new TelemetryService();
+  telemetry.on('metric', metric => mainWindow?.webContents.send('telemetry', metric));
   asr = new ASRService({
     provider: process.env.ASR_PROVIDER || 'whisper',
     silenceMs: Number(process.env.ASR_SILENCE_MS || 800),
@@ -40,33 +49,45 @@ function wirePipeline() {
     partialMinMs: Number(process.env.ASR_PARTIAL_MIN_MS || 1400)
   });
   audio = new SystemAudioService({ platform: process.platform, sampleRate: 16000, channels: 1 });
-  audio.on('audio', (chunk) => asr.pushAudio(chunk));
-  audio.on('status', (status) => mainWindow?.webContents.send('audio-status', status));
-  audio.on('error', (error) => mainWindow?.webContents.send('pipeline-error', { message: error.message }));
-  asr.on('status', (status) => mainWindow?.webContents.send('asr-status', status));
-  asr.on('error', (error) => mainWindow?.webContents.send('pipeline-error', { message: error.message }));
-  asr.on('partial', ({ text }) => mainWindow?.webContents.send('partial-transcript', { text }));
+  audio.on('audio', chunk => asr.pushAudio(chunk));
+  audio.on('status', status => mainWindow?.webContents.send('audio-status', status));
+  audio.on('error', error => mainWindow?.webContents.send('pipeline-error', { message: error.message }));
+  asr.on('status', status => mainWindow?.webContents.send('asr-status', status));
+  asr.on('error', error => mainWindow?.webContents.send('pipeline-error', { message: error.message }));
+  asr.on('partial', ({ text, provider }) => mainWindow?.webContents.send('partial-transcript', { text, provider }));
 
   asr.on('utterance', async ({ text }) => {
-    const isQuestion = questionDetector.isQuestion(text);
+    const classification = questionDetector.classify(text);
+    const isQuestion = classification.isQuestion;
     context.addTranscript(text, 'interviewer');
-    mainWindow?.webContents.send('transcript', { text, question: isQuestion });
-    if (!isQuestion || answerInFlight) return;
+    mainWindow?.webContents.send('transcript', { text, question: isQuestion, score: classification.score, followUp: classification.isFollowUp });
+    if (!isQuestion) return;
     const now = Date.now();
-    if (now - lastQuestionAt < Number(process.env.QUESTION_COOLDOWN_MS || 2500)) return;
+    if (!classification.isFollowUp && now - lastQuestionAt < Number(process.env.QUESTION_COOLDOWN_MS || 2500)) return;
     lastQuestionAt = now;
     if (!gemini.isConfigured()) return mainWindow?.webContents.send('pipeline-error', { message: 'Gemini is not configured. Add GEMINI_API_KEY to .env.' });
 
-    answerInFlight = true;
+    cancelGeneration(classification.isFollowUp ? 'follow-up-question' : 'new-question');
+    const controller = new AbortController();
+    const current = { controller, question: text, startedAt: Date.now() };
+    generation = current;
+    telemetry.record('question_to_generation_ms', Date.now() - current.startedAt);
     try {
       let answer = '';
-      mainWindow?.webContents.send('answer-start', { question: text });
-      for await (const token of gemini.stream(context.getPrompt({ mode: assistantMode, language: process.env.CODING_LANGUAGE || 'auto' }), { screenshotBase64: context.getScreenImage() })) {
+      mainWindow?.webContents.send('answer-start', { question: text, followUp: classification.isFollowUp });
+      for await (const token of gemini.stream(context.getPrompt({ mode: assistantMode, language: process.env.CODING_LANGUAGE || 'auto' }), {
+        screenshotBase64: context.getScreenImage(), signal: controller.signal,
+        onMetric: metric => telemetry.record(metric.name, metric.value)
+      })) {
+        if (generation !== current) return;
         answer += token; mainWindow?.webContents.send('answer-token', token);
       }
-      context.addAssistant(answer); mainWindow?.webContents.send('answer-complete', { text: answer });
-    } catch (error) { mainWindow?.webContents.send('pipeline-error', { message: error.message }); }
-    finally { answerInFlight = false; }
+      if (generation !== current) return;
+      context.addAssistant(answer); telemetry.record('answer_total_ms', Date.now() - current.startedAt);
+      mainWindow?.webContents.send('answer-complete', { text: answer });
+    } catch (error) {
+      if (!controller.signal.aborted) mainWindow?.webContents.send('pipeline-error', { message: error.message });
+    } finally { if (generation === current) generation = null; }
   });
 }
 
@@ -79,7 +100,7 @@ async function startPipeline(options = {}) {
 
 async function stopPipeline() {
   if (!running) return { stopped: true };
-  audio.stop(); await asr.stop(); running = false; answerInFlight = false;
+  cancelGeneration('pipeline-stopped'); audio.stop(); await asr.stop(); running = false;
   return { stopped: true };
 }
 
@@ -87,11 +108,13 @@ app.whenReady().then(async () => {
   await configureDesktopCapture(); createWindow(); wirePipeline();
   ipcMain.handle('pipeline:start', (_event, options = {}) => startPipeline(options));
   ipcMain.handle('pipeline:stop', () => stopPipeline());
+  ipcMain.handle('pipeline:cancel-answer', () => { cancelGeneration('manual'); return { cancelled: true }; });
   ipcMain.handle('pipeline:audio-chunk', (_event, arrayBuffer) => { if (!arrayBuffer || !running) return { accepted: false }; audio.pushRendererPcm(Buffer.from(arrayBuffer)); return { accepted: true }; });
   ipcMain.handle('pipeline:screen', (_event, base64Jpeg) => { if (!running || !base64Jpeg) return { accepted: false }; context.setScreenImage(base64Jpeg); return { accepted: true }; });
   ipcMain.handle('pipeline:capture-screen', () => { mainWindow?.webContents.send('capture-screen'); return { requested: true }; });
-  ipcMain.handle('pipeline:status', () => ({ audioConfigured: audio.isConfigured(), audioRunning: audio.running, audioMode: audio.mode, asrProvider: asr.provider, geminiConfigured: gemini.isConfigured(), platform: process.platform, running, assistantMode }));
+  ipcMain.handle('pipeline:metrics', () => telemetry.snapshot());
+  ipcMain.handle('pipeline:status', () => ({ audioConfigured: audio.isConfigured(), audioRunning: audio.running, audioMode: audio.mode, asrProvider: asr.provider, geminiConfigured: gemini.isConfigured(), platform: process.platform, running, assistantMode, generationActive: Boolean(generation) }));
   globalShortcut.register('CommandOrControl+Shift+Space', async () => { if (running) await stopPipeline(); else await startPipeline({ mode: process.platform === 'win32' ? 'desktop' : 'input' }); mainWindow?.webContents.send('pipeline-hotkey-state', { running, assistantMode }); });
 });
-app.on('will-quit', () => globalShortcut.unregisterAll());
+app.on('will-quit', () => { cancelGeneration('application-quit'); globalShortcut.unregisterAll(); });
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
