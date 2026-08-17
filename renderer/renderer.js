@@ -72,9 +72,7 @@ async function sendScreenSnapshot() {
     canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
     const dataUrl = canvas.toDataURL('image/jpeg', 0.62);
     await window.parashakthi.sendScreen(dataUrl.split(',')[1]);
-  } catch (_) {
-    // A screen snapshot is supplemental; audio capture continues if it fails.
-  }
+  } catch (_) {}
 }
 
 function startScreenSnapshots() {
@@ -82,11 +80,7 @@ function startScreenSnapshots() {
   void sendScreenSnapshot();
   screenTimer = setInterval(() => void sendScreenSnapshot(), 3000);
 }
-
-function stopScreenSnapshots() {
-  clearInterval(screenTimer);
-  screenTimer = null;
-}
+function stopScreenSnapshots() { clearInterval(screenTimer); screenTimer = null; }
 
 async function startAudioTransport(mode) {
   if (mode === 'desktop') {
@@ -99,7 +93,6 @@ async function startAudioTransport(mode) {
       video: false
     });
   }
-
   audioContext = new AudioContext();
   source = audioContext.createMediaStreamSource(mediaStream);
   processor = audioContext.createScriptProcessor(4096, 1, 1);
@@ -132,7 +125,7 @@ async function startPipeline() {
     const platformStatus = await window.parashakthi.status();
     const mode = platformStatus.platform === 'win32' ? 'desktop' : 'input';
     setState('starting…');
-    await window.parashakthi.start({ mode });
+    await window.parashakthi.start({ mode, assistantMode: modeSelect.value });
     await startAudioTransport(mode);
     running = true;
     startScreenSnapshots();
@@ -147,13 +140,10 @@ async function startPipeline() {
 
 document.getElementById('start').addEventListener('click', startPipeline);
 document.getElementById('stop').addEventListener('click', async () => {
-  await stopAudioTransport();
-  await window.parashakthi.stop();
-  setState('stopped');
+  await stopAudioTransport(); await window.parashakthi.stop(); setState('stopped');
 });
 captureScreenButton.addEventListener('click', () => window.parashakthi.captureScreenNow());
-modeSelect.addEventListener('change', () => { setState(`mode: ${modeSelect.value}`); });
-
+modeSelect.addEventListener('change', () => setState(`mode: ${modeSelect.value}`));
 window.parashakthi.onCaptureScreen(() => void sendScreenSnapshot());
 window.parashakthi.onHotkeyState(({ running: active }) => {
   if (active && !running) void startPipeline();
@@ -174,5 +164,4 @@ window.parashakthi.onAnswerStart(() => { answer.classList.remove('muted'); answe
 window.parashakthi.onAnswerToken((token) => { answer.classList.remove('muted'); answer.textContent += token; answer.scrollTop = answer.scrollHeight; });
 window.parashakthi.onAnswerComplete(() => { if (running) setState('listening'); });
 window.parashakthi.onError(({ message }) => setState(message));
-
 refreshAudioDevices();
