@@ -1,21 +1,25 @@
 require('dotenv').config();
-const { app, BrowserWindow, ipcMain, desktopCapturer, session } = require('electron');
+const { app, BrowserWindow, ipcMain, desktopCapturer, session, globalShortcut } = require('electron');
 const path = require('path');
 const SystemAudioService = require('./src/services/system-audio.service');
 const ASRService = require('./src/services/asr.service');
 const ContextService = require('./src/services/context.service');
+const QuestionService = require('./src/services/question.service');
 const GeminiService = require('./src/services/gemini.service');
 
 let mainWindow;
 let audio;
 let asr;
 let context;
+let questionDetector;
 let gemini;
+let running = false;
+let answerInFlight = false;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 560,
-    height: 760,
+    height: 800,
     minWidth: 440,
     minHeight: 600,
     alwaysOnTop: true,
@@ -38,15 +42,8 @@ async function configureDesktopCapture() {
         thumbnailSize: { width: 0, height: 0 }
       });
       if (!sources.length) throw new Error('No desktop capture source is available.');
-
-      // Electron's loopback device is supported on Windows. On macOS/Linux,
-      // the renderer falls back to a user-selected audio input (e.g. BlackHole
-      // on macOS or a PipeWire/Pulse monitor source on Linux).
-      if (process.platform === 'win32') {
-        callback({ video: sources[0], audio: 'loopback' });
-      } else {
-        callback({ video: sources[0] });
-      }
+      if (process.platform === 'win32') callback({ video: sources[0], audio: 'loopback' });
+      else callback({ video: sources[0] });
     } catch (error) {
       mainWindow?.webContents.send('pipeline-error', { message: error.message });
       callback({});
@@ -56,40 +53,37 @@ async function configureDesktopCapture() {
 
 function wirePipeline() {
   context = new ContextService();
+  questionDetector = new QuestionService();
   gemini = new GeminiService();
 
   asr = new ASRService({
     provider: process.env.ASR_PROVIDER || 'whisper',
     silenceMs: Number(process.env.ASR_SILENCE_MS || 800),
-    transcribeChunk: (audioBuffer) => asr.transcribe(audioBuffer)
+    maxUtteranceMs: Number(process.env.ASR_MAX_UTTERANCE_MS || 12000)
   });
 
-  audio = new SystemAudioService({
-    platform: process.platform,
-    sampleRate: 16000,
-    channels: 1
-  });
-
+  audio = new SystemAudioService({ platform: process.platform, sampleRate: 16000, channels: 1 });
   audio.on('audio', (chunk) => asr.pushAudio(chunk));
   audio.on('status', (status) => mainWindow?.webContents.send('audio-status', status));
   audio.on('error', (error) => mainWindow?.webContents.send('pipeline-error', { message: error.message }));
-
   asr.on('status', (status) => mainWindow?.webContents.send('asr-status', status));
   asr.on('error', (error) => mainWindow?.webContents.send('pipeline-error', { message: error.message }));
 
   asr.on('utterance', async ({ text }) => {
     context.addTranscript(text, 'interviewer');
-    mainWindow?.webContents.send('transcript', { text });
+    mainWindow?.webContents.send('transcript', { text, question: questionDetector.isQuestion(text) });
 
+    if (!questionDetector.isQuestion(text) || answerInFlight) return;
     if (!gemini.isConfigured()) {
       mainWindow?.webContents.send('pipeline-error', { message: 'Gemini is not configured. Add GEMINI_API_KEY to .env.' });
       return;
     }
 
+    answerInFlight = true;
     try {
       let answer = '';
       mainWindow?.webContents.send('answer-start');
-      for await (const token of gemini.stream(context.getPrompt())) {
+      for await (const token of gemini.stream(context.getPrompt({ mode: process.env.ASSISTANT_MODE || 'interview', language: process.env.CODING_LANGUAGE || 'auto' }), { screenshotBase64: context.getScreenImage() })) {
         answer += token;
         mainWindow?.webContents.send('answer-token', token);
       }
@@ -97,8 +91,26 @@ function wirePipeline() {
       mainWindow?.webContents.send('answer-complete', { text: answer });
     } catch (error) {
       mainWindow?.webContents.send('pipeline-error', { message: error.message });
+    } finally {
+      answerInFlight = false;
     }
   });
+}
+
+async function startPipeline(options = {}) {
+  if (running) return { alreadyRunning: true };
+  asr.start();
+  audio.start({ mode: options.mode || 'desktop' });
+  running = true;
+  return { configured: audio.isConfigured(), asr: asr.provider, mode: audio.mode, platform: process.platform };
+}
+
+async function stopPipeline() {
+  if (!running) return { stopped: true };
+  audio.stop();
+  await asr.stop();
+  running = false;
+  return { stopped: true };
 }
 
 app.whenReady().then(async () => {
@@ -106,39 +118,33 @@ app.whenReady().then(async () => {
   createWindow();
   wirePipeline();
 
-  ipcMain.handle('pipeline:start', async (_event, options = {}) => {
-    asr.start();
-    audio.start({ mode: options.mode || 'desktop' });
-    return {
-      configured: audio.isConfigured(),
-      asr: asr.provider,
-      mode: audio.mode,
-      platform: process.platform
-    };
-  });
-
-  ipcMain.handle('pipeline:stop', async () => {
-    audio.stop();
-    await asr.stop();
-    return { stopped: true };
-  });
-
+  ipcMain.handle('pipeline:start', (_event, options = {}) => startPipeline(options));
+  ipcMain.handle('pipeline:stop', () => stopPipeline());
   ipcMain.handle('pipeline:audio-chunk', (_event, arrayBuffer) => {
-    if (!arrayBuffer) return { accepted: false };
+    if (!arrayBuffer || !running) return { accepted: false };
     audio.pushRendererPcm(Buffer.from(arrayBuffer));
     return { accepted: true };
   });
-
+  ipcMain.handle('pipeline:screen', (_event, base64Jpeg) => {
+    if (!running || !base64Jpeg) return { accepted: false };
+    context.setScreenImage(base64Jpeg);
+    return { accepted: true };
+  });
+  ipcMain.handle('pipeline:capture-screen', () => {
+    mainWindow?.webContents.send('capture-screen');
+    return { requested: true };
+  });
   ipcMain.handle('pipeline:status', () => ({
-    audioConfigured: audio.isConfigured(),
-    audioRunning: audio.running,
-    audioMode: audio.mode,
-    asrProvider: asr.provider,
-    geminiConfigured: gemini.isConfigured(),
-    platform: process.platform
+    audioConfigured: audio.isConfigured(), audioRunning: audio.running, audioMode: audio.mode,
+    asrProvider: asr.provider, geminiConfigured: gemini.isConfigured(), platform: process.platform, running
   }));
+
+  globalShortcut.register('CommandOrControl+Shift+Space', async () => {
+    if (running) await stopPipeline();
+    else await startPipeline({ mode: process.platform === 'win32' ? 'desktop' : 'input' });
+    mainWindow?.webContents.send('pipeline-hotkey-state', { running });
+  });
 });
 
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit();
-});
+app.on('will-quit', () => globalShortcut.unregisterAll());
+app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
