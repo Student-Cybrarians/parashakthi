@@ -1,6 +1,6 @@
 {
   "name": "parashakthi",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Real-time desktop meeting and interview assistant",
   "main": "main.js",
@@ -17,13 +17,27 @@
     "dotenv": "^16.4.7"
   },
   "devDependencies": {
-    "electron": "^37.0.0",
+    "electron": "^40.5.0",
     "electron-builder": "^26.0.12"
   },
   "build": {
     "appId": "dev.studentcybrarians.parashakthi",
     "productName": "Parashakthi",
     "directories": { "output": "dist" },
-    "files": ["**/*", "!dist/**/*", "!.git/**/*", "!.env*"]
+    "files": ["**/*", "!dist/**/*", "!.git/**/*", "!.env*"],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": ["dmg", "zip"],
+      "extendInfo": {
+        "NSAudioCaptureUsageDescription": "Parashakthi captures desktop audio that you explicitly start so it can transcribe your meeting locally or with your configured speech provider.",
+        "NSScreenCaptureUsageDescription": "Parashakthi captures the desktop only when you start meeting context capture."
+      }
+    },
+    "win": {
+      "target": ["nsis", "zip"]
+    },
+    "linux": {
+      "target": ["AppImage", "deb"]
+    }
   }
 }
