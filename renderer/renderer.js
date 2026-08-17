@@ -1,70 +1,13 @@
-const state = document.getElementById('state');
-const transcript = document.getElementById('transcript');
-const answer = document.getElementById('answer');
-const deviceSelect = document.getElementById('device');
-const modeSelect = document.getElementById('mode');
-const captureScreenButton = document.getElementById('capture-screen');
-let mediaStream = null, audioContext = null, processor = null, source = null, running = false, screenTimer = null;
-let partialLine = '';
-function setState(text) { state.textContent = text; }
-async function refreshAudioDevices() {
-  if (!navigator.mediaDevices?.enumerateDevices) return;
-  try {
-    const devices = await navigator.mediaDevices.enumerateDevices(); const inputs = devices.filter((d) => d.kind === 'audioinput');
-    deviceSelect.innerHTML = '<option value="">Default audio input</option>';
-    for (const device of inputs) { const option = document.createElement('option'); option.value = device.deviceId; option.textContent = device.label || `Audio input ${deviceSelect.length}`; deviceSelect.appendChild(option); }
-  } catch (error) { setState(`audio devices: ${error.message}`); }
-}
-function floatToPcm16(float32) { const pcm = new Int16Array(float32.length); for (let i = 0; i < float32.length; i += 1) { const sample = Math.max(-1, Math.min(1, float32[i])); pcm[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff; } return pcm; }
-function downsampleTo16k(input, inputRate) {
-  if (inputRate === 16000) return input; const ratio = inputRate / 16000; const output = new Float32Array(Math.max(1, Math.floor(input.length / ratio))); let offset = 0;
-  for (let i = 0; i < output.length; i += 1) { const next = Math.min(input.length, Math.round((i + 1) * ratio)); let sum = 0; for (let j = offset; j < next; j += 1) sum += input[j]; output[i] = next > offset ? sum / (next - offset) : 0; offset = next; }
-  return output;
-}
-async function sendScreenSnapshot() {
-  if (!running || !mediaStream) return; const videoTrack = mediaStream.getVideoTracks()[0]; if (!videoTrack) return;
-  const video = document.createElement('video'); video.muted = true; video.playsInline = true; video.srcObject = new MediaStream([videoTrack]);
-  try { await video.play(); await new Promise((resolve) => requestAnimationFrame(resolve)); const canvas = document.createElement('canvas'); const maxWidth = 1600; const scale = Math.min(1, maxWidth / Math.max(1, video.videoWidth)); canvas.width = Math.max(1, Math.round(video.videoWidth * scale)); canvas.height = Math.max(1, Math.round(video.videoHeight * scale)); canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height); const dataUrl = canvas.toDataURL('image/jpeg', 0.62); await window.parashakthi.sendScreen(dataUrl.split(',')[1]); } catch (_) {}
-}
-function startScreenSnapshots() { clearInterval(screenTimer); void sendScreenSnapshot(); screenTimer = setInterval(() => void sendScreenSnapshot(), 3000); }
-function stopScreenSnapshots() { clearInterval(screenTimer); screenTimer = null; }
-async function startAudioTransport(mode) {
-  if (mode === 'desktop') mediaStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
-  else mediaStream = await navigator.mediaDevices.getUserMedia({ audio: deviceSelect.value ? { deviceId: { exact: deviceSelect.value }, channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false } : { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false }, video: false });
-  audioContext = new AudioContext(); source = audioContext.createMediaStreamSource(mediaStream); processor = audioContext.createScriptProcessor(4096, 1, 1);
-  processor.onaudioprocess = (event) => { if (!running) return; const mono = event.inputBuffer.getChannelData(0); const pcm = floatToPcm16(downsampleTo16k(mono, audioContext.sampleRate)); void window.parashakthi.sendAudio(pcm.buffer); };
-  source.connect(processor); const silent = audioContext.createGain(); silent.gain.value = 0; processor.connect(silent); silent.connect(audioContext.destination);
-}
-async function stopAudioTransport() { running = false; stopScreenSnapshots(); if (processor) processor.disconnect(); if (source) source.disconnect(); if (audioContext) await audioContext.close().catch(() => {}); if (mediaStream) mediaStream.getTracks().forEach((track) => track.stop()); processor = null; source = null; audioContext = null; mediaStream = null; partialLine = ''; }
-async function startPipeline() {
-  if (running) return;
-  try { const platformStatus = await window.parashakthi.status(); const mode = platformStatus.platform === 'win32' ? 'desktop' : 'input'; setState('starting…'); await window.parashakthi.start({ mode, assistantMode: modeSelect.value }); await startAudioTransport(mode); running = true; startScreenSnapshots(); setState(mode === 'desktop' ? 'capturing system audio' : 'capturing selected input'); await refreshAudioDevices(); }
-  catch (error) { await stopAudioTransport(); try { await window.parashakthi.stop(); } catch (_) {} setState(error.message); }
-}
-document.getElementById('start').addEventListener('click', startPipeline);
-document.getElementById('stop').addEventListener('click', async () => { await stopAudioTransport(); await window.parashakthi.stop(); setState('stopped'); });
-captureScreenButton.addEventListener('click', () => window.parashakthi.captureScreenNow());
-modeSelect.addEventListener('change', () => setState(`mode: ${modeSelect.value}`));
-window.parashakthi.onCaptureScreen(() => void sendScreenSnapshot());
-window.parashakthi.onHotkeyState(({ running: active }) => { if (active && !running) void startPipeline(); else if (!active && running) void stopAudioTransport().then(() => setState('stopped')); });
-window.parashakthi.onAudioStatus((s) => { if (s?.state) setState(s.state); });
-window.parashakthi.onAsrStatus((s) => { if (s?.state === 'transcribing') setState(`transcribing with ${s.provider}`); else if (s?.state === 'listening' && running) setState('listening'); });
-window.parashakthi.onPartialTranscript(({ text }) => {
-  if (!running || !text) return;
-  partialLine = text;
-  const base = transcript.textContent.replace(/\n?◌ .*$/s, '').replace(/\n?… .*$/s, '');
-  transcript.textContent = `${base}${base.trim() ? '\n' : ''}… ${partialLine}`;
-  transcript.scrollTop = transcript.scrollHeight;
-});
-window.parashakthi.onTranscript(({ text, question }) => {
-  transcript.classList.remove('muted'); partialLine = '';
-  const base = transcript.textContent.replace(/\n?… .*$/s, '').replace(/\n?◌ .*$/s, '');
-  const empty = !base.trim() || base.includes('Waiting for interviewer');
-  transcript.textContent = `${empty ? '' : base + '\n'}${question ? '❓ ' : ''}${text}`;
-  transcript.scrollTop = transcript.scrollHeight;
-});
-window.parashakthi.onAnswerStart(() => { answer.classList.remove('muted'); answer.textContent = ''; });
-window.parashakthi.onAnswerToken((token) => { answer.classList.remove('muted'); answer.textContent += token; answer.scrollTop = answer.scrollHeight; });
-window.parashakthi.onAnswerComplete(() => { if (running) setState('listening'); });
-window.parashakthi.onError(({ message }) => setState(message));
-refreshAudioDevices();
+const state=document.getElementById('state'),transcript=document.getElementById('transcript'),answer=document.getElementById('answer'),deviceSelect=document.getElementById('device'),modeSelect=document.getElementById('mode'),styleSelect=document.getElementById('style'),asrSelect=document.getElementById('asr');
+const captureScreenButton=document.getElementById('capture-screen');let mediaStream=null,audioContext=null,processor=null,source=null,running=false,screenTimer=null,partialLine='';
+function setState(t){state.textContent=t}async function refreshAudioDevices(){if(!navigator.mediaDevices?.enumerateDevices)return;try{const ds=await navigator.mediaDevices.enumerateDevices(),inputs=ds.filter(d=>d.kind==='audioinput');deviceSelect.innerHTML='<option value="">Default audio input</option>';for(const d of inputs){const o=document.createElement('option');o.value=d.deviceId;o.textContent=d.label||`Audio input ${deviceSelect.length}`;deviceSelect.appendChild(o)}}catch(e){setState(`audio devices: ${e.message}`)}}
+function floatToPcm16(a){const p=new Int16Array(a.length);for(let i=0;i<a.length;i++){const s=Math.max(-1,Math.min(1,a[i]));p[i]=s<0?s*32768:s*32767}return p}function downsampleTo16k(input,rate){if(rate===16000)return input;const ratio=rate/16000,out=new Float32Array(Math.max(1,Math.floor(input.length/ratio)));let off=0;for(let i=0;i<out.length;i++){const next=Math.min(input.length,Math.round((i+1)*ratio));let sum=0;for(let j=off;j<next;j++)sum+=input[j];out[i]=next>off?sum/(next-off):0;off=next}return out}
+async function sendScreenSnapshot(){if(!running||!mediaStream)return;const track=mediaStream.getVideoTracks()[0];if(!track)return;const video=document.createElement('video');video.muted=true;video.playsInline=true;video.srcObject=new MediaStream([track]);try{await video.play();await new Promise(r=>requestAnimationFrame(r));const c=document.createElement('canvas'),mw=1600,scale=Math.min(1,mw/Math.max(1,video.videoWidth));c.width=Math.max(1,Math.round(video.videoWidth*scale));c.height=Math.max(1,Math.round(video.videoHeight*scale));c.getContext('2d').drawImage(video,0,0,c.width,c.height);await window.parashakthi.sendScreen(c.toDataURL('image/jpeg',.62).split(',')[1])}catch(_){} }
+function startScreenSnapshots(){clearInterval(screenTimer);void sendScreenSnapshot();screenTimer=setInterval(()=>void sendScreenSnapshot(),3000)}function stopScreenSnapshots(){clearInterval(screenTimer);screenTimer=null}
+async function startAudioTransport(mode){if(mode==='desktop')mediaStream=await navigator.mediaDevices.getDisplayMedia({video:true,audio:true});else mediaStream=await navigator.mediaDevices.getUserMedia({audio:deviceSelect.value?{deviceId:{exact:deviceSelect.value},channelCount:1,echoCancellation:false,noiseSuppression:false,autoGainControl:false}:{channelCount:1,echoCancellation:false,noiseSuppression:false,autoGainControl:false},video:false});audioContext=new AudioContext();source=audioContext.createMediaStreamSource(mediaStream);processor=audioContext.createScriptProcessor(4096,1,1);processor.onaudioprocess=e=>{if(!running)return;const pcm=floatToPcm16(downsampleTo16k(e.inputBuffer.getChannelData(0),audioContext.sampleRate));void window.parashakthi.sendAudio(pcm.buffer)};source.connect(processor);const silent=audioContext.createGain();silent.gain.value=0;processor.connect(silent);silent.connect(audioContext.destination)}
+async function stopAudioTransport(){running=false;stopScreenSnapshots();if(processor)processor.disconnect();if(source)source.disconnect();if(audioContext)await audioContext.close().catch(()=>{});if(mediaStream)mediaStream.getTracks().forEach(t=>t.stop());processor=source=audioContext=mediaStream=null;partialLine=''}
+async function applySettings(){const s=await window.parashakthi.settings.get();modeSelect.value=s.assistantMode||'interview';styleSelect.value=s.responseStyle||'concise';asrSelect.value=s.asrProvider||'whisper'}async function startPipeline(){if(running)return;try{const st=await window.parashakthi.status(),mode=st.platform==='win32'?'desktop':'input';setState('starting…');await window.parashakthi.start({mode,assistantMode:modeSelect.value});await startAudioTransport(mode);running=true;startScreenSnapshots();setState(mode==='desktop'?'capturing system audio':'capturing selected input');await refreshAudioDevices()}catch(e){await stopAudioTransport();try{await window.parashakthi.stop()}catch(_){}setState(e.message)}}
+document.getElementById('start').addEventListener('click',startPipeline);document.getElementById('stop').addEventListener('click',async()=>{await stopAudioTransport();await window.parashakthi.stop();setState('stopped')});document.getElementById('cancel').addEventListener('click',()=>window.parashakthi.cancelAnswer());captureScreenButton.addEventListener('click',()=>window.parashakthi.captureScreenNow());
+modeSelect.addEventListener('change',()=>window.parashakthi.settings.update({assistantMode:modeSelect.value}));styleSelect.addEventListener('change',()=>window.parashakthi.settings.update({responseStyle:styleSelect.value}));asrSelect.addEventListener('change',async()=>{await window.parashakthi.settings.update({asrProvider:asrSelect.value});setState('ASR setting saved; restart capture to apply')});document.getElementById('export').addEventListener('click',async()=>{try{await window.parashakthi.session.export()}catch(e){setState(e.message)}});document.getElementById('reset-settings').addEventListener('click',async()=>{await window.parashakthi.settings.reset();await applySettings();setState('settings reset')});
+window.parashakthi.onCaptureScreen(()=>void sendScreenSnapshot());window.parashakthi.onHotkeyState(({running:active})=>{if(active&&!running)void startPipeline();else if(!active&&running)void stopAudioTransport().then(()=>setState('stopped'))});window.parashakthi.onAudioStatus(s=>{if(s?.state)setState(s.state)});window.parashakthi.onAsrStatus(s=>{if(s?.state==='transcribing')setState(`transcribing with ${s.provider}`);else if(s?.state==='listening'&&running)setState('listening')});
+window.parashakthi.onPartialTranscript(({text})=>{if(!running||!text)return;partialLine=text;const base=transcript.textContent.replace(/\n?◌ .*$/s,'').replace(/\n?… .*$/s,'');transcript.textContent=`${base}${base.trim()?'\n':''}… ${partialLine}`;transcript.scrollTop=transcript.scrollHeight});window.parashakthi.onTranscript(({text,question})=>{transcript.classList.remove('muted');partialLine='';const base=transcript.textContent.replace(/\n?… .*$/s,'').replace(/\n?◌ .*$/s,'');const empty=!base.trim()||base.includes('Waiting for interviewer');transcript.textContent=`${empty?'':base+'\n'}${question?'❓ ':''}${text}`;transcript.scrollTop=transcript.scrollHeight});window.parashakthi.onAnswerStart(()=>{answer.classList.remove('muted');answer.textContent=''});window.parashakthi.onAnswerToken(t=>{answer.classList.remove('muted');answer.textContent+=t;answer.scrollTop=answer.scrollHeight});window.parashakthi.onAnswerComplete(()=>{if(running)setState('listening')});window.parashakthi.onAnswerCancelled(()=>{if(running)setState('listening')});window.parashakthi.onError(({message})=>setState(message));refreshAudioDevices();applySettings();
