@@ -1,13 +1,14 @@
 {
   "name": "parashakthi",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "Real-time desktop meeting and interview assistant",
   "main": "main.js",
+  "engines": { "node": ">=22.12.0" },
   "scripts": {
     "start": "electron .",
     "dev": "electron . --no-sandbox --disable-gpu",
-    "test": "node --test test/**/*.test.js",
+    "test": "node --test test",
     "build": "electron-builder",
     "build:win": "electron-builder --win",
     "build:mac": "electron-builder --mac",
