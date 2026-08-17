@@ -1,8 +1,10 @@
 class ContextService {
-  constructor({ maxTurns = 80 } = {}) {
+  constructor({ maxTurns = 80, maxScreenAgeMs = 15000 } = {}) {
     this.maxTurns = maxTurns;
+    this.maxScreenAgeMs = maxScreenAgeMs;
     this.turns = [];
-    this.latestScreenContext = '';
+    this.latestScreenImage = null;
+    this.latestScreenAt = 0;
   }
 
   addTranscript(text, source = 'interviewer') {
@@ -19,8 +21,16 @@ class ContextService {
     this._trim();
   }
 
-  setScreenContext(text) {
-    this.latestScreenContext = String(text || '').trim();
+  setScreenImage(base64Jpeg) {
+    const value = String(base64Jpeg || '').trim();
+    if (!value) return;
+    this.latestScreenImage = value;
+    this.latestScreenAt = Date.now();
+  }
+
+  getScreenImage() {
+    if (!this.latestScreenImage || Date.now() - this.latestScreenAt > this.maxScreenAgeMs) return null;
+    return this.latestScreenImage;
   }
 
   getPrompt({ mode = 'interview', language = 'auto' } = {}) {
@@ -29,8 +39,9 @@ class ContextService {
       `You are a real-time ${mode} assistant.`,
       `Coding language: ${language}.`,
       'Answer the latest interviewer question using the available context.',
-      'Prefer a direct, technically correct answer. For coding questions, provide an efficient solution and brief complexity analysis.',
-      this.latestScreenContext ? `SCREEN CONTEXT:\n${this.latestScreenContext}` : '',
+      'Do not mention that you are an AI assistant. Be concise enough for a live conversation.',
+      'For coding questions, provide an efficient solution and brief complexity analysis.',
+      'If the screenshot contains a coding problem, error, diagram, or relevant shared-screen context, incorporate it.',
       transcript ? `CONVERSATION:\n${transcript}` : ''
     ].filter(Boolean).join('\n\n');
   }
