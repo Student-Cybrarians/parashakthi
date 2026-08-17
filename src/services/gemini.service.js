@@ -10,11 +10,15 @@ class GeminiService {
     return Boolean(this.client);
   }
 
-  async *stream(prompt) {
+  async *stream(prompt, { screenshotBase64 = null } = {}) {
     if (!this.client) throw new Error('GEMINI_API_KEY is not configured');
+    const parts = [{ text: prompt }];
+    if (screenshotBase64) {
+      parts.push({ inlineData: { mimeType: 'image/jpeg', data: screenshotBase64 } });
+    }
     const response = await this.client.models.generateContentStream({
       model: this.model,
-      contents: prompt,
+      contents: [{ role: 'user', parts }],
       config: {
         temperature: 0.2,
         maxOutputTokens: 1200
