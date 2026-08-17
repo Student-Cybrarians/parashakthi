@@ -12,7 +12,7 @@ function pcm16ToWav(pcm, sampleRate = 16000, channels = 1) {
   buffer.write('WAVE', 8);
   buffer.write('fmt ', 12);
   buffer.writeUInt32LE(16, 16);
-  buffer.writeUInt16LE(1, 20); // PCM
+  buffer.writeUInt16LE(1, 20);
   buffer.writeUInt16LE(channels, 22);
   buffer.writeUInt32LE(sampleRate, 24);
   buffer.writeUInt32LE(sampleRate * channels * 2, 28);
@@ -24,27 +24,10 @@ function pcm16ToWav(pcm, sampleRate = 16000, channels = 1) {
   return buffer;
 }
 
-function commandForProvider(provider) {
-  if (provider === 'parakeet') {
-    const command = process.env.PARAKEET_COMMAND || 'python';
-    const args = process.env.PARAKEET_ARGS
-      ? process.env.PARAKEET_ARGS.split(' ').filter(Boolean)
-      : [path.join(__dirname, '../../scripts/parakeet_worker.py')];
-    return { command, args };
-  }
-
-  const command = process.env.WHISPER_COMMAND || 'python';
-  const args = process.env.WHISPER_ARGS
-    ? process.env.WHISPER_ARGS.split(' ').filter(Boolean)
-    : ['-m', 'whisper'];
-  return { command, args };
-}
-
 /**
- * Streaming ASR coordinator. Audio arrives as mono 16 kHz signed PCM. Each
- * natural pause is converted to a WAV and handed to the selected local ASR
- * backend. The provider boundary is deliberately process-based so heavy ML
- * runtimes do not become Electron renderer dependencies.
+ * Streaming ASR coordinator with a persistent Python worker. Keeping Whisper
+ * or Parakeet loaded in one process removes model-load latency from every
+ * utterance and keeps the Electron main process responsive.
  */
 class ASRService extends EventEmitter {
   constructor({ provider = 'whisper', silenceMs = 800, maxUtteranceMs = 12000 } = {}) {
@@ -58,12 +41,17 @@ class ASRService extends EventEmitter {
     this.startedAt = 0;
     this.flushInFlight = false;
     this.queuedFlush = false;
+    this.worker = null;
+    this.workerBuffer = '';
+    this.requestId = 0;
+    this.pending = new Map();
   }
 
   start() {
     this.running = true;
     this.buffer = [];
     this.startedAt = Date.now();
+    this._ensureWorker();
     this.emit('status', { state: 'listening', provider: this.provider });
   }
 
@@ -71,11 +59,62 @@ class ASRService extends EventEmitter {
     if (!this.running || !chunk?.length) return;
     this.buffer.push(Buffer.from(chunk));
     clearTimeout(this.timer);
-    this.timer = setTimeout(() => this.flush('silence'), this.silenceMs);
+    this.timer = setTimeout(() => void this.flush('silence'), this.silenceMs);
+    if (Date.now() - this.startedAt >= this.maxUtteranceMs) await this.flush('max-duration');
+  }
 
-    if (Date.now() - this.startedAt >= this.maxUtteranceMs) {
-      await this.flush('max-duration');
-    }
+  _ensureWorker() {
+    if (this.worker && !this.worker.killed) return;
+    const python = process.env.ASR_PYTHON || process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+    const workerPath = path.join(__dirname, '../../scripts/asr_worker.py');
+    this.worker = spawn(python, [workerPath, this.provider], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    this.workerBuffer = '';
+
+    this.worker.stdout.on('data', (data) => {
+      this.workerBuffer += data.toString();
+      let newline;
+      while ((newline = this.workerBuffer.indexOf('\n')) >= 0) {
+        const line = this.workerBuffer.slice(0, newline).trim();
+        this.workerBuffer = this.workerBuffer.slice(newline + 1);
+        if (!line) continue;
+        try {
+          const response = JSON.parse(line);
+          const pending = this.pending.get(response.id);
+          if (!pending) continue;
+          this.pending.delete(response.id);
+          if (response.error) pending.reject(new Error(response.error));
+          else pending.resolve(String(response.text || '').trim());
+        } catch (error) {
+          this.emit('error', new Error(`Invalid ASR worker response: ${error.message}`));
+        }
+      }
+    });
+
+    this.worker.stderr.on('data', (data) => {
+      const message = data.toString().trim();
+      if (message) this.emit('status', { state: 'worker-log', provider: this.provider, message });
+    });
+
+    this.worker.on('error', (error) => {
+      for (const pending of this.pending.values()) pending.reject(error);
+      this.pending.clear();
+      this.emit('error', new Error(`Could not start ${this.provider} worker: ${error.message}`));
+    });
+
+    this.worker.on('close', (code) => {
+      for (const pending of this.pending.values()) pending.reject(new Error(`${this.provider} worker exited with code ${code}`));
+      this.pending.clear();
+      this.worker = null;
+    });
+  }
+
+  _transcribeFile(wavPath) {
+    this._ensureWorker();
+    return new Promise((resolve, reject) => {
+      const id = `${Date.now()}-${++this.requestId}`;
+      this.pending.set(id, { resolve, reject });
+      this.worker.stdin.write(`${JSON.stringify({ id, wav: wavPath })}\n`);
+    });
   }
 
   async flush(reason = 'manual') {
@@ -90,7 +129,7 @@ class ASRService extends EventEmitter {
     const audio = Buffer.concat(this.buffer);
     this.buffer = [];
     this.startedAt = Date.now();
-    if (audio.length < 3200) return ''; // <100 ms at 16 kHz mono 16-bit
+    if (audio.length < 3200) return '';
 
     this.flushInFlight = true;
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'parashakthi-asr-'));
@@ -116,36 +155,6 @@ class ASRService extends EventEmitter {
     }
   }
 
-  _transcribeFile(wavPath) {
-    const { command, args } = commandForProvider(this.provider);
-    const providerArgs = this.provider === 'whisper'
-      ? [...args, wavPath, '--output_format', 'txt', '--output_dir', path.dirname(wavPath), '--fp16', 'False']
-      : [...args, wavPath];
-
-    return new Promise((resolve, reject) => {
-      const child = spawn(command, providerArgs, { windowsHide: true });
-      let stdout = '';
-      let stderr = '';
-      child.stdout.on('data', (data) => { stdout += data.toString(); });
-      child.stderr.on('data', (data) => { stderr += data.toString(); });
-      child.on('error', (error) => reject(new Error(`ASR process failed: ${error.message}`)));
-      child.on('close', (code) => {
-        if (code !== 0) {
-          reject(new Error(`${this.provider} exited with code ${code}: ${stderr.trim() || 'no diagnostic'}`));
-          return;
-        }
-
-        if (this.provider === 'whisper') {
-          const txtPath = path.join(path.dirname(wavPath), `${path.basename(wavPath, '.wav')}.txt`);
-          resolve(fs.existsSync(txtPath) ? fs.readFileSync(txtPath, 'utf8').trim() : stdout.trim());
-        } else {
-          // Parakeet worker emits plain text on stdout.
-          resolve(stdout.trim());
-        }
-      });
-    });
-  }
-
   async transcribe(audioBuffer) {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'parashakthi-asr-'));
     const wavPath = path.join(tempDir, 'chunk.wav');
@@ -161,6 +170,10 @@ class ASRService extends EventEmitter {
     if (!this.running) return;
     await this.flush('stop');
     this.running = false;
+    clearTimeout(this.timer);
+    this.timer = null;
+    if (this.worker && !this.worker.killed) this.worker.kill();
+    this.worker = null;
     this.emit('status', { state: 'stopped', provider: this.provider });
   }
 }
