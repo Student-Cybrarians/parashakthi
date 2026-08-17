@@ -8,8 +8,10 @@ A privacy-conscious desktop meeting assistant with system-audio capture, local A
 - ✅ macOS/Linux selectable audio input path
 - ✅ 16 kHz mono PCM transport
 - ✅ Persistent Whisper / Parakeet TDT v3 worker
+- ✅ Low-latency overlapping partial transcription
 - ✅ Pause/max-duration utterance segmentation
-- ✅ Automatic interviewer-question detection
+- ✅ Automatic interviewer-question detection and duplicate suppression
+- ✅ Automatic Gemini response triggering with cooldown
 - ✅ Rolling conversation memory
 - ✅ Automatic screen snapshots while capture is active
 - ✅ Multimodal Gemini prompts with the latest screen image
@@ -19,7 +21,6 @@ A privacy-conscious desktop meeting assistant with system-audio capture, local A
 - ✅ Cross-platform Electron packaging
 - ✅ Automated unit tests and CI builds
 - ✅ Tag-triggered release workflow
-- 🟡 True token-level/partial ASR depends on the selected ASR runtime
 - 🟡 Hardware-specific audio validation must run on the target OS
 - 🟡 macOS signing/notarization requires developer credentials
 
@@ -41,23 +42,26 @@ Google Meet / browser audio
    - Whisper
    - Parakeet TDT v3
           |
-          v
-  Utterance / pause boundary
-          |
-          v
- Question detector
-          |
-          +-------------------+
-          |                   |
-          v                   v
- Rolling transcript     Latest screen image
-          |                   |
-          +---------+---------+
-                    v
-               Gemini multimodal
-                    |
-                    v
-             Streaming answer UI
+          +----------------------+
+          | low-latency partials |
+          +----------+-----------+
+                     v
+             Pause/max boundary
+                     |
+                     v
+             Question detector
+                     |
+          +----------+----------+
+          |                     |
+          v                     v
+ Rolling transcript      Latest screen image
+          |                     |
+          +----------+----------+
+                     v
+              Gemini multimodal
+                     |
+                     v
+              Streaming answer UI
 ```
 
 ## Desktop audio
@@ -84,6 +88,16 @@ Parakeet TDT v3:
 ASR_PROVIDER=parakeet
 ASR_PYTHON=python
 PARAKEET_MODEL=nvidia/parakeet-tdt-0.6b-v3
+```
+
+Latency tuning:
+
+```env
+ASR_PARTIAL_INTERVAL_MS=2200
+ASR_PARTIAL_MIN_MS=1400
+ASR_SILENCE_MS=800
+ASR_MAX_UTTERANCE_MS=12000
+QUESTION_COOLDOWN_MS=2500
 ```
 
 Install the runtime dependencies:
@@ -137,8 +151,8 @@ Pushing to `master-branch` runs tests and Windows/macOS/Linux builds. Pushing a 
 ## Architecture
 
 - `src/services/system-audio.service.js` — audio transport and platform policy.
-- `src/services/asr.service.js` — buffering, segmentation, worker lifecycle, and recovery.
-- `src/services/question.service.js` — question boundary heuristic.
+- `src/services/asr.service.js` — buffering, low-latency partial recognition, segmentation, worker lifecycle, and recovery.
+- `src/services/question.service.js` — question boundary heuristic and duplicate suppression.
 - `scripts/asr_worker.py` — persistent Whisper/Parakeet process.
 - `src/services/context.service.js` — rolling transcript and screen context.
 - `src/services/gemini.service.js` — Gemini multimodal streaming generation.
@@ -147,7 +161,7 @@ Pushing to `master-branch` runs tests and Windows/macOS/Linux builds. Pushing a 
 
 ## Known limitations
 
-- True token-level partial transcription is provider/runtime dependent; the current stable path emits utterances after pause/max-duration segmentation.
+- Partial transcription is implemented as overlapping short-window recognition. Native token-level streaming depends on the selected ASR runtime and is not assumed by this architecture.
 - macOS/Linux may require a virtual/monitor audio input depending on OS version and audio stack.
 - Parakeet is ML-heavy and may have high CPU latency without suitable acceleration.
 - End-to-end audio, permissions, GPU behavior, and installers must still be exercised on real target machines.
