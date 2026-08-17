@@ -2,16 +2,17 @@ const state = document.getElementById('state');
 const transcript = document.getElementById('transcript');
 const answer = document.getElementById('answer');
 const deviceSelect = document.getElementById('device');
+const modeSelect = document.getElementById('mode');
+const captureScreenButton = document.getElementById('capture-screen');
 
 let mediaStream = null;
 let audioContext = null;
 let processor = null;
 let source = null;
 let running = false;
+let screenTimer = null;
 
-function setState(text) {
-  state.textContent = text;
-}
+function setState(text) { state.textContent = text; }
 
 async function refreshAudioDevices() {
   if (!navigator.mediaDevices?.enumerateDevices) return;
@@ -25,9 +26,7 @@ async function refreshAudioDevices() {
       option.textContent = device.label || `Audio input ${deviceSelect.length}`;
       deviceSelect.appendChild(option);
     }
-  } catch (error) {
-    setState(`audio devices: ${error.message}`);
-  }
+  } catch (error) { setState(`audio devices: ${error.message}`); }
 }
 
 function floatToPcm16(float32) {
@@ -42,41 +41,63 @@ function floatToPcm16(float32) {
 function downsampleTo16k(input, inputRate) {
   if (inputRate === 16000) return input;
   const ratio = inputRate / 16000;
-  const outputLength = Math.max(1, Math.floor(input.length / ratio));
-  const output = new Float32Array(outputLength);
+  const output = new Float32Array(Math.max(1, Math.floor(input.length / ratio)));
   let offset = 0;
-  for (let i = 0; i < outputLength; i += 1) {
-    const nextOffset = Math.min(input.length, Math.round((i + 1) * ratio));
+  for (let i = 0; i < output.length; i += 1) {
+    const next = Math.min(input.length, Math.round((i + 1) * ratio));
     let sum = 0;
-    let count = 0;
-    for (let j = offset; j < nextOffset; j += 1) {
-      sum += input[j];
-      count += 1;
-    }
-    output[i] = count ? sum / count : 0;
-    offset = nextOffset;
+    for (let j = offset; j < next; j += 1) sum += input[j];
+    output[i] = next > offset ? sum / (next - offset) : 0;
+    offset = next;
   }
   return output;
 }
 
+async function sendScreenSnapshot() {
+  if (!running || !mediaStream) return;
+  const videoTrack = mediaStream.getVideoTracks()[0];
+  if (!videoTrack) return;
+  const video = document.createElement('video');
+  video.muted = true;
+  video.playsInline = true;
+  video.srcObject = new MediaStream([videoTrack]);
+  try {
+    await video.play();
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    const canvas = document.createElement('canvas');
+    const maxWidth = 1600;
+    const scale = Math.min(1, maxWidth / Math.max(1, video.videoWidth));
+    canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+    canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+    canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.62);
+    await window.parashakthi.sendScreen(dataUrl.split(',')[1]);
+  } catch (_) {
+    // A screen snapshot is supplemental; audio capture continues if it fails.
+  }
+}
+
+function startScreenSnapshots() {
+  clearInterval(screenTimer);
+  void sendScreenSnapshot();
+  screenTimer = setInterval(() => void sendScreenSnapshot(), 3000);
+}
+
+function stopScreenSnapshots() {
+  clearInterval(screenTimer);
+  screenTimer = null;
+}
+
 async function startAudioTransport(mode) {
   if (mode === 'desktop') {
-    // getDisplayMedia is handled by Electron's main-process permission handler.
-    // Windows receives the OS loopback audio track; the video track is stopped
-    // immediately because Parashakthi only needs the audio stream here.
-    mediaStream = await navigator.mediaDevices.getDisplayMedia({
-      video: true,
-      audio: true
-    });
-    mediaStream.getVideoTracks().forEach((track) => track.stop());
+    mediaStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
   } else {
-    const constraints = {
+    mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: deviceSelect.value
         ? { deviceId: { exact: deviceSelect.value }, channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false }
         : { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false },
       video: false
-    };
-    mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+    });
   }
 
   audioContext = new AudioContext();
@@ -85,14 +106,10 @@ async function startAudioTransport(mode) {
   processor.onaudioprocess = (event) => {
     if (!running) return;
     const mono = event.inputBuffer.getChannelData(0);
-    const sixteenK = downsampleTo16k(mono, audioContext.sampleRate);
-    const pcm = floatToPcm16(sixteenK);
-    // Backpressure is intentionally handled by the main-process ASR queue.
+    const pcm = floatToPcm16(downsampleTo16k(mono, audioContext.sampleRate));
     void window.parashakthi.sendAudio(pcm.buffer);
   };
   source.connect(processor);
-  // ScriptProcessor needs an output connection to fire in Chromium. Connect
-  // to a silent gain node rather than the speakers to avoid feedback.
   const silent = audioContext.createGain();
   silent.gain.value = 0;
   processor.connect(silent);
@@ -101,17 +118,15 @@ async function startAudioTransport(mode) {
 
 async function stopAudioTransport() {
   running = false;
+  stopScreenSnapshots();
   if (processor) processor.disconnect();
   if (source) source.disconnect();
   if (audioContext) await audioContext.close().catch(() => {});
   if (mediaStream) mediaStream.getTracks().forEach((track) => track.stop());
-  processor = null;
-  source = null;
-  audioContext = null;
-  mediaStream = null;
+  processor = null; source = null; audioContext = null; mediaStream = null;
 }
 
-document.getElementById('start').addEventListener('click', async () => {
+async function startPipeline() {
   if (running) return;
   try {
     const platformStatus = await window.parashakthi.status();
@@ -120,6 +135,7 @@ document.getElementById('start').addEventListener('click', async () => {
     await window.parashakthi.start({ mode });
     await startAudioTransport(mode);
     running = true;
+    startScreenSnapshots();
     setState(mode === 'desktop' ? 'capturing system audio' : 'capturing selected input');
     await refreshAudioDevices();
   } catch (error) {
@@ -127,42 +143,36 @@ document.getElementById('start').addEventListener('click', async () => {
     try { await window.parashakthi.stop(); } catch (_) {}
     setState(error.message);
   }
-});
+}
 
+document.getElementById('start').addEventListener('click', startPipeline);
 document.getElementById('stop').addEventListener('click', async () => {
   await stopAudioTransport();
   await window.parashakthi.stop();
   setState('stopped');
 });
+captureScreenButton.addEventListener('click', () => window.parashakthi.captureScreenNow());
+modeSelect.addEventListener('change', () => { setState(`mode: ${modeSelect.value}`); });
 
-window.parashakthi.onAudioStatus((s) => {
-  if (s?.state) setState(s.state);
+window.parashakthi.onCaptureScreen(() => void sendScreenSnapshot());
+window.parashakthi.onHotkeyState(({ running: active }) => {
+  if (active && !running) void startPipeline();
+  else if (!active && running) void stopAudioTransport().then(() => setState('stopped'));
 });
+window.parashakthi.onAudioStatus((s) => { if (s?.state) setState(s.state); });
 window.parashakthi.onAsrStatus((s) => {
   if (s?.state === 'transcribing') setState(`transcribing with ${s.provider}`);
   else if (s?.state === 'listening' && running) setState('listening');
 });
-window.parashakthi.onTranscript(({ text }) => {
+window.parashakthi.onTranscript(({ text, question }) => {
   transcript.classList.remove('muted');
-  transcript.textContent += `${transcript.textContent.trim() && !transcript.textContent.includes('Waiting for') ? '\n' : ''}${text}`;
+  const empty = !transcript.textContent.trim() || transcript.textContent.includes('Waiting for interviewer');
+  transcript.textContent += `${empty ? '' : '\n'}${question ? '❓ ' : ''}${text}`;
   transcript.scrollTop = transcript.scrollHeight;
-  answer.textContent = '';
-  answer.classList.remove('muted');
 });
-window.parashakthi.onAnswerStart(() => {
-  answer.classList.remove('muted');
-  answer.textContent = '';
-});
-window.parashakthi.onAnswerToken((token) => {
-  answer.classList.remove('muted');
-  answer.textContent += token;
-  answer.scrollTop = answer.scrollHeight;
-});
-window.parashakthi.onAnswerComplete(() => {
-  if (running) setState('listening');
-});
-window.parashakthi.onError(({ message }) => {
-  setState(message);
-});
+window.parashakthi.onAnswerStart(() => { answer.classList.remove('muted'); answer.textContent = ''; });
+window.parashakthi.onAnswerToken((token) => { answer.classList.remove('muted'); answer.textContent += token; answer.scrollTop = answer.scrollHeight; });
+window.parashakthi.onAnswerComplete(() => { if (running) setState('listening'); });
+window.parashakthi.onError(({ message }) => setState(message));
 
 refreshAudioDevices();
