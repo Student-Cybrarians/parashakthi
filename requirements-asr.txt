@@ -1,0 +1,10 @@
+# Whisper backend
+openai-whisper>=20240930
+
+# Parakeet TDT v3 backend
+# Parakeet's current Transformers integration is documented by NVIDIA.
+# Use a recent Transformers build until the model integration lands in a stable release.
+git+https://github.com/huggingface/transformers.git
+transformers>=4.48.0
+torch>=2.2.0
+soundfile>=0.12.1
