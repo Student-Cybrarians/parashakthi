@@ -8,6 +8,7 @@ contextBridge.exposeInMainWorld('parashakthi', {
   sendScreen: (base64Jpeg) => ipcRenderer.invoke('pipeline:screen', base64Jpeg),
   captureScreenNow: () => ipcRenderer.invoke('pipeline:capture-screen'),
   onCaptureScreen: (handler) => ipcRenderer.on('capture-screen', () => handler()),
+  onHotkeyState: (handler) => ipcRenderer.on('pipeline-hotkey-state', (_event, data) => handler(data)),
   onTranscript: (handler) => ipcRenderer.on('transcript', (_event, data) => handler(data)),
   onAnswerStart: (handler) => ipcRenderer.on('answer-start', () => handler()),
   onAnswerToken: (handler) => ipcRenderer.on('answer-token', (_event, token) => handler(token)),
